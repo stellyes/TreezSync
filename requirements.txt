@@ -1,0 +1,3 @@
+# Lambda dependencies
+pg8000>=1.30.0
+boto3>=1.34.0
