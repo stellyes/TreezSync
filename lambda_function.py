@@ -1,7 +1,14 @@
 """
 Treez + METRC Data Sync Lambda Function
 Extracts data from Treez API (retail operations) and METRC API (compliance/inventory)
-and loads into Aurora PostgreSQL
+and loads into Aurora PostgreSQL with proper normalization and relationship linking.
+
+Features:
+- Product catalog sync with brand resolution
+- Vendor/Distributor normalization with fuzzy matching
+- Brand normalization with alias resolution
+- METRC package and transfer tracking
+- Data discrepancy flagging for manual review
 
 Runs daily at 11:00 PM PST via EventBridge
 """
@@ -9,13 +16,15 @@ Runs daily at 11:00 PM PST via EventBridge
 import os
 import json
 import logging
+import hashlib
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 import urllib.request
 import urllib.parse
 import ssl
 import base64
+import re
 
 # Configure logging
 logger = logging.getLogger()
@@ -63,6 +72,34 @@ METRC_BASE_URL = "https://api-ca.metrc.com"
 
 # SSL context for API calls
 ssl_context = ssl.create_default_context()
+
+
+# ============================================
+# UTILITY FUNCTIONS
+# ============================================
+
+def normalize_string(s: str) -> str:
+    """Normalize a string for comparison (lowercase, strip whitespace, remove special chars)"""
+    if not s:
+        return ''
+    return re.sub(r'[^a-z0-9]', '', s.lower().strip())
+
+
+def calculate_similarity(str1: str, str2: str) -> float:
+    """Calculate a simple similarity score between two strings (0-1)"""
+    s1 = normalize_string(str1)
+    s2 = normalize_string(str2)
+
+    if s1 == s2:
+        return 1.0
+
+    if not s1 or not s2:
+        return 0.0
+
+    max_len = max(len(s1), len(s2))
+    common_chars = sum(1 for c in s1 if c in s2)
+
+    return round(common_chars / max_len, 4)
 
 
 class TreezAPIClient:
@@ -131,9 +168,16 @@ class TreezAPIClient:
 
     def ensure_authenticated(self):
         """Ensure we have a valid access token"""
-        if not self.access_token or (self.token_expires_at and datetime.now() >= self.token_expires_at):
+        if not self.access_token:
             if not self.authenticate():
                 raise Exception("Failed to authenticate with Treez API")
+        elif self.token_expires_at:
+            # Compare as naive datetimes (remove timezone info)
+            now = datetime.now()
+            expires = self.token_expires_at.replace(tzinfo=None) if self.token_expires_at.tzinfo else self.token_expires_at
+            if now >= expires:
+                if not self.authenticate():
+                    raise Exception("Failed to authenticate with Treez API")
 
     # ==========================================
     # TICKET (SALES) API
@@ -428,6 +472,16 @@ class DatabaseClient:
         cursor.execute(query, params)
         return cursor
 
+    def fetchone(self, query: str, params: tuple = None):
+        """Execute a query and fetch one result"""
+        cursor = self.execute(query, params)
+        return cursor.fetchone()
+
+    def fetchall(self, query: str, params: tuple = None):
+        """Execute a query and fetch all results"""
+        cursor = self.execute(query, params)
+        return cursor.fetchall()
+
     def commit(self):
         """Commit transaction"""
         self.conn.commit()
@@ -438,16 +492,18 @@ class DatabaseClient:
 
 
 class DataSync:
-    """Main sync orchestrator for Treez + METRC data"""
+    """Main sync orchestrator for Treez + METRC data with normalization and flagging"""
 
     def __init__(self, treez_client: Optional[TreezAPIClient],
                  metrc_client: Optional[MetrcAPIClient],
                  db_client: DatabaseClient,
-                 store_name: str = 'Barbary Coast'):
+                 store_name: str = 'Barbary Coast',
+                 storefront_id: str = None):
         self.treez = treez_client
         self.metrc = metrc_client
         self.db = db_client
         self.store_name = store_name
+        self.storefront_id = storefront_id
         self.sync_stats = {
             'tickets_synced': 0,
             'customers_synced': 0,
@@ -455,12 +511,289 @@ class DataSync:
             'invoices_synced': 0,
             'packages_synced': 0,
             'transfers_synced': 0,
+            'flags_created': 0,
+            'vendors_resolved': 0,
+            'brands_resolved': 0,
             'errors': []
         }
+
+        # Cache for vendor and brand lookups
+        self._vendor_cache = {}
+        self._brand_cache = {}
+        self._load_normalization_caches()
+
+    def _load_normalization_caches(self):
+        """Load vendor and brand normalization caches from database"""
+        try:
+            # Load vendor aliases
+            rows = self.db.fetchall("""
+                SELECT va.alias_name, v.id, v.canonical_name
+                FROM vendor_aliases va
+                JOIN vendors v ON va.vendor_id = v.id
+            """)
+            for row in rows:
+                self._vendor_cache[normalize_string(row[0])] = {
+                    'id': row[1],
+                    'canonical_name': row[2]
+                }
+
+            # Also add canonical names
+            rows = self.db.fetchall("SELECT id, canonical_name FROM vendors")
+            for row in rows:
+                self._vendor_cache[normalize_string(row[1])] = {
+                    'id': row[0],
+                    'canonical_name': row[1]
+                }
+
+            # Load brand aliases
+            rows = self.db.fetchall("""
+                SELECT ba.alias_name, b.id, b.canonical_name
+                FROM brand_aliases ba
+                JOIN canonical_brands b ON ba.brand_id = b.id
+            """)
+            for row in rows:
+                self._brand_cache[normalize_string(row[0])] = {
+                    'id': row[1],
+                    'canonical_name': row[2]
+                }
+
+            # Also add canonical names
+            rows = self.db.fetchall("SELECT id, canonical_name FROM canonical_brands")
+            for row in rows:
+                self._brand_cache[normalize_string(row[1])] = {
+                    'id': row[0],
+                    'canonical_name': row[1]
+                }
+
+            logger.info(f"Loaded {len(self._vendor_cache)} vendor mappings, {len(self._brand_cache)} brand mappings")
+
+        except Exception as e:
+            logger.warning(f"Could not load normalization caches: {e}")
+
+    def resolve_vendor(self, vendor_name: str) -> Tuple[Optional[str], Optional[str], float]:
+        """
+        Resolve a vendor name to canonical vendor ID.
+        Returns (vendor_id, canonical_name, similarity_score)
+        """
+        if not vendor_name:
+            return None, None, 0.0
+
+        normalized = normalize_string(vendor_name)
+
+        # Check cache first
+        if normalized in self._vendor_cache:
+            self.sync_stats['vendors_resolved'] += 1
+            return self._vendor_cache[normalized]['id'], self._vendor_cache[normalized]['canonical_name'], 1.0
+
+        # Try fuzzy matching
+        best_match = None
+        best_score = 0.0
+
+        for key, value in self._vendor_cache.items():
+            score = calculate_similarity(vendor_name, value['canonical_name'])
+            if score > best_score:
+                best_score = score
+                best_match = value
+
+        if best_match and best_score >= 0.8:
+            self.sync_stats['vendors_resolved'] += 1
+            return best_match['id'], best_match['canonical_name'], best_score
+
+        return None, None, best_score
+
+    def resolve_brand(self, brand_name: str) -> Tuple[Optional[str], Optional[str], float]:
+        """
+        Resolve a brand name to canonical brand ID.
+        Returns (brand_id, canonical_name, similarity_score)
+        """
+        if not brand_name:
+            return None, None, 0.0
+
+        normalized = normalize_string(brand_name)
+
+        # Check cache first
+        if normalized in self._brand_cache:
+            self.sync_stats['brands_resolved'] += 1
+            return self._brand_cache[normalized]['id'], self._brand_cache[normalized]['canonical_name'], 1.0
+
+        # Try fuzzy matching
+        best_match = None
+        best_score = 0.0
+
+        for key, value in self._brand_cache.items():
+            score = calculate_similarity(brand_name, value['canonical_name'])
+            if score > best_score:
+                best_score = score
+                best_match = value
+
+        if best_match and best_score >= 0.8:
+            self.sync_stats['brands_resolved'] += 1
+            return best_match['id'], best_match['canonical_name'], best_score
+
+        return None, None, best_score
+
+    def create_data_flag(self, flag_type: str, severity: str, source_table: str,
+                         source_record_id: str, title: str, description: str,
+                         raw_value: str = None, suggested_match: str = None,
+                         suggested_match_id: str = None, similarity_score: float = None,
+                         metadata: Dict = None):
+        """Create a data discrepancy flag for manual review"""
+        try:
+            self.db.execute("""
+                INSERT INTO data_flags (
+                    id, storefront_id, flag_type, severity, status, source_table,
+                    source_record_id, title, description, raw_value, suggested_match,
+                    suggested_match_id, similarity_score, metadata, created_at, updated_at
+                )
+                VALUES (
+                    gen_random_uuid(), %s, %s, %s, 'pending', %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, NOW(), NOW()
+                )
+                ON CONFLICT DO NOTHING
+            """, (
+                self.storefront_id,
+                flag_type,
+                severity,
+                source_table,
+                source_record_id,
+                title,
+                description,
+                raw_value,
+                suggested_match,
+                suggested_match_id,
+                similarity_score,
+                json.dumps(metadata or {})
+            ))
+            self.sync_stats['flags_created'] += 1
+            logger.info(f"Created data flag: {title}")
+        except Exception as e:
+            logger.error(f"Error creating data flag: {e}")
 
     # ==========================================
     # TREEZ SYNC METHODS
     # ==========================================
+
+    def sync_products(self, since_datetime: str = None):
+        """Sync product catalog from Treez API"""
+        if not self.treez:
+            logger.warning("Treez client not configured, skipping product sync")
+            return
+
+        logger.info("Syncing product catalog from Treez")
+
+        try:
+            if since_datetime:
+                products = self.treez.fetch_all_pages(
+                    self.treez.get_products_by_last_updated,
+                    since_datetime,
+                    page_size=1000
+                )
+            else:
+                products = self.treez.fetch_all_pages(
+                    self.treez.get_products,
+                    page_size=1000
+                )
+
+            logger.info(f"Found {len(products)} products to sync")
+
+            for product in products:
+                try:
+                    self._upsert_product(product)
+                    self.sync_stats['products_synced'] += 1
+                except Exception as e:
+                    logger.error(f"Error syncing product {product.get('product_id')}: {str(e)}")
+                    self.sync_stats['errors'].append(f"Product {product.get('product_id')}: {str(e)}")
+
+            self.db.commit()
+            logger.info(f"Successfully synced {self.sync_stats['products_synced']} products")
+
+        except Exception as e:
+            logger.error(f"Error syncing products: {str(e)}")
+            self.db.rollback()
+            self.sync_stats['errors'].append(f"Product sync: {str(e)}")
+
+    def _upsert_product(self, product: Dict):
+        """Insert or update a product with brand resolution"""
+        product_id = str(product.get('product_id') or product.get('id'))
+        brand_name = product.get('brand', '')
+        product_name = product.get('name', '')
+        product_type = product.get('product_type') or product.get('category_type')
+        product_subtype = product.get('product_subtype') or product.get('subcategory')
+
+        # Resolve brand
+        brand_id, canonical_brand, brand_score = self.resolve_brand(brand_name)
+
+        # If brand not found but we have a name, create a flag
+        if not brand_id and brand_name:
+            self.create_data_flag(
+                flag_type='brand_mismatch',
+                severity='medium' if brand_score < 0.5 else 'low',
+                source_table='products',
+                source_record_id=product_id,
+                title=f'Unknown brand: {brand_name}',
+                description=f'Product "{product_name}" has brand "{brand_name}" which could not be resolved.',
+                raw_value=brand_name,
+                similarity_score=brand_score,
+                metadata={'product_type': product_type}
+            )
+
+        # Extract numeric values
+        retail_price = product.get('retail_price') or product.get('price')
+        wholesale_price = product.get('wholesale_price') or product.get('cost')
+        quantity = product.get('quantity_on_hand') or product.get('quantity') or 0
+        thc = product.get('thc_content') or product.get('thc')
+        cbd = product.get('cbd_content') or product.get('cbd')
+
+        self.db.execute("""
+            INSERT INTO products (
+                id, treez_product_id, storefront_id, brand_id, original_brand_name,
+                product_name, product_type, product_subtype, category, strain,
+                unit_size, thc_content, cbd_content, retail_price, wholesale_price,
+                quantity_on_hand, is_active, last_synced_at, created_at, updated_at
+            )
+            VALUES (
+                gen_random_uuid(), %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, NOW(), NOW(), NOW()
+            )
+            ON CONFLICT (treez_product_id)
+            DO UPDATE SET
+                brand_id = COALESCE(EXCLUDED.brand_id, products.brand_id),
+                original_brand_name = EXCLUDED.original_brand_name,
+                product_name = EXCLUDED.product_name,
+                product_type = COALESCE(EXCLUDED.product_type, products.product_type),
+                product_subtype = COALESCE(EXCLUDED.product_subtype, products.product_subtype),
+                category = COALESCE(EXCLUDED.category, products.category),
+                strain = COALESCE(EXCLUDED.strain, products.strain),
+                unit_size = COALESCE(EXCLUDED.unit_size, products.unit_size),
+                thc_content = COALESCE(EXCLUDED.thc_content, products.thc_content),
+                cbd_content = COALESCE(EXCLUDED.cbd_content, products.cbd_content),
+                retail_price = COALESCE(EXCLUDED.retail_price, products.retail_price),
+                wholesale_price = COALESCE(EXCLUDED.wholesale_price, products.wholesale_price),
+                quantity_on_hand = EXCLUDED.quantity_on_hand,
+                is_active = EXCLUDED.is_active,
+                last_synced_at = NOW(),
+                updated_at = NOW()
+        """, (
+            product_id,
+            self.storefront_id,
+            brand_id,
+            brand_name,
+            product_name,
+            product_type,
+            product_subtype,
+            product.get('category'),
+            product.get('strain'),
+            product.get('unit_size'),
+            float(thc) if thc else None,
+            float(cbd) if cbd else None,
+            float(retail_price) if retail_price else None,
+            float(wholesale_price) if wholesale_price else None,
+            int(quantity),
+            product.get('is_active', True)
+        ))
 
     def sync_tickets(self, date: str):
         """Sync tickets (sales) for a specific date"""
@@ -649,7 +982,7 @@ class DataSync:
         ))
 
     def sync_invoices(self, start_date: str, end_date: str):
-        """Sync invoices within a date range"""
+        """Sync invoices within a date range with vendor normalization"""
         if not self.treez:
             logger.warning("Treez client not configured, skipping invoice sync")
             return
@@ -683,27 +1016,46 @@ class DataSync:
             self.sync_stats['errors'].append(f"Invoice sync: {str(e)}")
 
     def _upsert_invoice(self, invoice: Dict):
-        """Insert or update an invoice"""
+        """Insert or update an invoice with vendor normalization"""
         invoice_id = str(invoice.get('invoice_id') or invoice.get('id'))
         invoice_number = invoice.get('invoice_number') or invoice.get('number')
         invoice_date = invoice.get('created_date') or invoice.get('invoice_date')
+
+        # Get vendor name and try to normalize
         vendor_name = invoice.get('distributor', {}).get('name') if invoice.get('distributor') else None
+        vendor_id, canonical_vendor, vendor_score = self.resolve_vendor(vendor_name)
+
+        # If vendor not found but we have a name, create a flag
+        if not vendor_id and vendor_name:
+            self.create_data_flag(
+                flag_type='vendor_mismatch',
+                severity='medium' if vendor_score < 0.5 else 'low',
+                source_table='invoices',
+                source_record_id=invoice_id,
+                title=f'Unknown vendor: {vendor_name}',
+                description=f'Invoice {invoice_number or invoice_id} has vendor "{vendor_name}" which could not be resolved.',
+                raw_value=vendor_name,
+                similarity_score=vendor_score,
+                metadata={'invoice_number': invoice_number, 'invoice_date': invoice_date}
+            )
+
         total_cost = Decimal(str(invoice.get('total_cost', 0) or 0))
         line_items = invoice.get('line_items', [])
 
         cursor = self.db.execute("""
             INSERT INTO invoices (
-                id, invoice_id, invoice_number, invoice_date, original_vendor_name,
+                id, invoice_id, invoice_number, invoice_date, vendor_id, original_vendor_name,
                 customer_name, total_cost, line_items_count, created_at, updated_at
             )
             VALUES (
-                gen_random_uuid(), %s, %s, %s::date, %s,
+                gen_random_uuid(), %s, %s, %s::date, %s, %s,
                 %s, %s, %s, NOW(), NOW()
             )
             ON CONFLICT (invoice_id)
             DO UPDATE SET
                 invoice_number = COALESCE(EXCLUDED.invoice_number, invoices.invoice_number),
                 invoice_date = COALESCE(EXCLUDED.invoice_date, invoices.invoice_date),
+                vendor_id = COALESCE(EXCLUDED.vendor_id, invoices.vendor_id),
                 original_vendor_name = COALESCE(EXCLUDED.original_vendor_name, invoices.original_vendor_name),
                 total_cost = EXCLUDED.total_cost,
                 line_items_count = EXCLUDED.line_items_count,
@@ -713,6 +1065,7 @@ class DataSync:
             invoice_id,
             invoice_number,
             invoice_date.split('T')[0] if invoice_date and 'T' in invoice_date else invoice_date,
+            vendor_id,
             vendor_name,
             self.store_name,
             float(total_cost),
@@ -724,28 +1077,47 @@ class DataSync:
 
         if db_invoice_id and line_items:
             for idx, item in enumerate(line_items):
-                self._upsert_invoice_line_item(db_invoice_id, idx + 1, item)
+                self._upsert_invoice_line_item(db_invoice_id, invoice_id, idx + 1, item)
 
-    def _upsert_invoice_line_item(self, invoice_id: str, line_number: int, item: Dict):
-        """Insert or update an invoice line item"""
-        brand = item.get('brand', 'Unknown')
+    def _upsert_invoice_line_item(self, db_invoice_id: str, treez_invoice_id: str, line_number: int, item: Dict):
+        """Insert or update an invoice line item with brand normalization"""
+        brand_name = item.get('brand', 'Unknown')
         product_name = item.get('product_name') or item.get('name')
         product_type = item.get('product_type') or item.get('category_type')
+
+        # Resolve brand
+        brand_id, canonical_brand, brand_score = self.resolve_brand(brand_name)
+
+        # If brand not found but we have a name, create a flag
+        if not brand_id and brand_name and brand_name != 'Unknown':
+            self.create_data_flag(
+                flag_type='brand_mismatch',
+                severity='low',
+                source_table='invoice_line_items',
+                source_record_id=f"{treez_invoice_id}_{line_number}",
+                title=f'Unknown brand in invoice: {brand_name}',
+                description=f'Invoice line item has brand "{brand_name}" which could not be resolved.',
+                raw_value=brand_name,
+                similarity_score=brand_score,
+                metadata={'product_name': product_name, 'product_type': product_type}
+            )
+
         sku_units = int(item.get('quantity', 0) or 0)
         unit_cost = Decimal(str(item.get('unit_cost', 0) or 0))
         total_cost = Decimal(str(item.get('total_cost', 0) or 0))
 
         self.db.execute("""
             INSERT INTO invoice_line_items (
-                id, invoice_id, line_number, original_brand_name, product_name,
+                id, invoice_id, line_number, brand_id, original_brand_name, product_name,
                 product_type, sku_units, unit_cost, total_cost, created_at
             )
             VALUES (
-                gen_random_uuid(), %s, %s, %s, %s,
+                gen_random_uuid(), %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, NOW()
             )
             ON CONFLICT (invoice_id, line_number)
             DO UPDATE SET
+                brand_id = COALESCE(EXCLUDED.brand_id, invoice_line_items.brand_id),
                 original_brand_name = EXCLUDED.original_brand_name,
                 product_name = EXCLUDED.product_name,
                 product_type = EXCLUDED.product_type,
@@ -753,9 +1125,10 @@ class DataSync:
                 unit_cost = EXCLUDED.unit_cost,
                 total_cost = EXCLUDED.total_cost
         """, (
-            invoice_id,
+            db_invoice_id,
             line_number,
-            brand,
+            brand_id,
+            brand_name,
             product_name,
             product_type,
             sku_units,
@@ -783,7 +1156,7 @@ class DataSync:
 
                 for package in packages:
                     try:
-                        self._upsert_metrc_package(package)
+                        self._upsert_metrc_package(package, 'active')
                         self.sync_stats['packages_synced'] += 1
                     except Exception as e:
                         logger.error(f"Error syncing package {package.get('Label')}: {str(e)}")
@@ -792,24 +1165,94 @@ class DataSync:
                 self.db.commit()
                 logger.info(f"Successfully synced {self.sync_stats['packages_synced']} packages")
 
+            # Also sync on-hold packages
+            try:
+                on_hold = self.metrc.get_packages_on_hold()
+                if isinstance(on_hold, list):
+                    for package in on_hold:
+                        self._upsert_metrc_package(package, 'on_hold')
+                    self.db.commit()
+            except Exception as e:
+                logger.warning(f"Could not sync on-hold packages: {e}")
+
+            # Also sync in-transit packages
+            try:
+                in_transit = self.metrc.get_packages_in_transit()
+                if isinstance(in_transit, list):
+                    for package in in_transit:
+                        self._upsert_metrc_package(package, 'in_transit')
+                    self.db.commit()
+            except Exception as e:
+                logger.warning(f"Could not sync in-transit packages: {e}")
+
         except Exception as e:
             logger.error(f"Error syncing METRC packages: {str(e)}")
             self.db.rollback()
             self.sync_stats['errors'].append(f"METRC package sync: {str(e)}")
 
-    def _upsert_metrc_package(self, package: Dict):
+    def _upsert_metrc_package(self, package: Dict, status: str):
         """Insert or update a METRC package record"""
-        # This would require a new table - metrc_packages
-        # For now, we can enhance invoice line items with METRC trace IDs
         label = package.get('Label')
-        item_name = package.get('Item', {}).get('Name') if isinstance(package.get('Item'), dict) else package.get('ItemName')
+        item = package.get('Item', {})
+        item_name = item.get('Name') if isinstance(item, dict) else package.get('ItemName')
+        product_category = item.get('ProductCategoryName') if isinstance(item, dict) else package.get('ProductCategoryName')
+
         quantity = package.get('Quantity', 0)
         unit = package.get('UnitOfMeasureName')
-        product_category = package.get('Item', {}).get('ProductCategoryName') if isinstance(package.get('Item'), dict) else package.get('ProductCategoryName')
+        source_harvest = package.get('SourceHarvestNames')
+        lab_test_state = package.get('LabTestingState')
+        lab_passed = package.get('LabTestingStatePassed')
+        received_from = package.get('ReceivedFromFacilityName')
+        received_dt = package.get('ReceivedDateTime')
+        packaged_date = package.get('PackagedDate')
+        last_modified = package.get('LastModified')
 
-        # Store in a dedicated METRC inventory table (if exists)
-        # Or update existing invoice line items with trace IDs
-        pass  # Implement based on your specific table structure
+        self.db.execute("""
+            INSERT INTO metrc_packages (
+                id, metrc_label, storefront_id, item_name, product_category,
+                quantity, unit_of_measure, package_status, source_harvest_name,
+                lab_test_state, lab_test_passed, received_from_facility,
+                received_date_time, packaged_date, last_modified_at,
+                created_at, updated_at
+            )
+            VALUES (
+                gen_random_uuid(), %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s::timestamp, %s::date, %s::timestamp,
+                NOW(), NOW()
+            )
+            ON CONFLICT (metrc_label)
+            DO UPDATE SET
+                item_name = EXCLUDED.item_name,
+                product_category = EXCLUDED.product_category,
+                quantity = EXCLUDED.quantity,
+                unit_of_measure = EXCLUDED.unit_of_measure,
+                package_status = EXCLUDED.package_status,
+                source_harvest_name = EXCLUDED.source_harvest_name,
+                lab_test_state = EXCLUDED.lab_test_state,
+                lab_test_passed = EXCLUDED.lab_test_passed,
+                received_from_facility = EXCLUDED.received_from_facility,
+                received_date_time = COALESCE(EXCLUDED.received_date_time, metrc_packages.received_date_time),
+                packaged_date = COALESCE(EXCLUDED.packaged_date, metrc_packages.packaged_date),
+                last_modified_at = EXCLUDED.last_modified_at,
+                updated_at = NOW()
+        """, (
+            label,
+            self.storefront_id,
+            item_name,
+            product_category,
+            float(quantity) if quantity else 0,
+            unit,
+            status,
+            source_harvest,
+            lab_test_state,
+            lab_passed,
+            received_from,
+            received_dt,
+            packaged_date.split('T')[0] if packaged_date and 'T' in packaged_date else packaged_date,
+            last_modified
+        ))
 
     def sync_metrc_transfers(self, last_modified_start: Optional[str] = None):
         """Sync incoming transfers from METRC"""
@@ -827,7 +1270,7 @@ class DataSync:
 
                 for transfer in transfers:
                     try:
-                        self._process_metrc_transfer(transfer)
+                        self._upsert_metrc_transfer(transfer, 'incoming')
                         self.sync_stats['transfers_synced'] += 1
                     except Exception as e:
                         logger.error(f"Error syncing transfer {transfer.get('Id')}: {str(e)}")
@@ -841,23 +1284,72 @@ class DataSync:
             self.db.rollback()
             self.sync_stats['errors'].append(f"METRC transfer sync: {str(e)}")
 
-    def _process_metrc_transfer(self, transfer: Dict):
-        """Process a METRC transfer - can be used to enrich invoice data"""
+    def _upsert_metrc_transfer(self, transfer: Dict, transfer_type: str):
+        """Insert or update a METRC transfer record"""
         transfer_id = transfer.get('Id')
         manifest_number = transfer.get('ManifestNumber')
-        shipper_name = transfer.get('ShipperFacilityName')
-        created_date = transfer.get('CreatedDateTime')
+        shipper_facility = transfer.get('ShipperFacilityName')
+        shipper_license = transfer.get('ShipperFacilityLicenseNumber')
+        recipient_facility = transfer.get('RecipientFacilityName')
+        recipient_license = transfer.get('RecipientFacilityLicenseNumber')
+        created_dt = transfer.get('CreatedDateTime')
+        received_dt = transfer.get('ReceivedDateTime')
+        last_modified = transfer.get('LastModified')
 
-        # Get deliveries for this transfer
+        # Try to get package count and total quantity from deliveries
+        package_count = 0
+        total_quantity = Decimal('0')
         try:
             deliveries = self.metrc.get_transfer_deliveries(transfer_id)
             for delivery in deliveries:
                 delivery_id = delivery.get('Id')
-                # Get packages in delivery
                 packages = self.metrc.get_delivery_packages(delivery_id)
-                # Could use this to match with invoice line items by trace ID
+                package_count += len(packages)
+                for pkg in packages:
+                    total_quantity += Decimal(str(pkg.get('ShippedQuantity', 0) or 0))
         except Exception as e:
-            logger.warning(f"Could not get delivery details for transfer {transfer_id}: {str(e)}")
+            logger.warning(f"Could not get delivery details for transfer {transfer_id}: {e}")
+
+        self.db.execute("""
+            INSERT INTO metrc_transfers (
+                id, metrc_transfer_id, storefront_id, manifest_number, transfer_type,
+                shipper_facility, shipper_license, recipient_facility, recipient_license,
+                created_date_time, received_date_time, package_count, total_quantity,
+                last_modified_at, created_at, updated_at
+            )
+            VALUES (
+                gen_random_uuid(), %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s::timestamp, %s::timestamp, %s, %s,
+                %s::timestamp, NOW(), NOW()
+            )
+            ON CONFLICT (metrc_transfer_id)
+            DO UPDATE SET
+                manifest_number = EXCLUDED.manifest_number,
+                shipper_facility = EXCLUDED.shipper_facility,
+                shipper_license = EXCLUDED.shipper_license,
+                recipient_facility = EXCLUDED.recipient_facility,
+                recipient_license = EXCLUDED.recipient_license,
+                received_date_time = COALESCE(EXCLUDED.received_date_time, metrc_transfers.received_date_time),
+                package_count = EXCLUDED.package_count,
+                total_quantity = EXCLUDED.total_quantity,
+                last_modified_at = EXCLUDED.last_modified_at,
+                updated_at = NOW()
+        """, (
+            transfer_id,
+            self.storefront_id,
+            manifest_number,
+            transfer_type,
+            shipper_facility,
+            shipper_license,
+            recipient_facility,
+            recipient_license,
+            created_dt,
+            received_dt,
+            package_count,
+            float(total_quantity),
+            last_modified
+        ))
 
     # ==========================================
     # MAIN SYNC ORCHESTRATION
@@ -873,6 +1365,12 @@ class DataSync:
         logger.info(f"Starting daily sync for {today}")
 
         # ========== TREEZ DATA ==========
+
+        # Sync product catalog first (for brand/product linking)
+        try:
+            self.sync_products(yesterday_datetime)
+        except Exception as e:
+            logger.error(f"Product sync failed: {str(e)}")
 
         # Sync today's closed tickets (sales)
         try:

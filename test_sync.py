@@ -35,6 +35,7 @@ def test_treez_connection():
     print("="*50)
 
     api_key = os.environ.get('TREEZ_API_KEY')
+    client_id = os.environ.get('TREEZ_CLIENT_ID', 'chapters_sync')
     dispensary = os.environ.get('TREEZ_DISPENSARY', 'barbarycoast')
 
     if not api_key:
@@ -42,25 +43,43 @@ def test_treez_connection():
         return False
 
     print(f"Dispensary: {dispensary}")
+    print(f"Client ID: {client_id}")
     print(f"API Key: {api_key[:10]}...")
 
-    client = TreezAPIClient(api_key, dispensary)
+    client = TreezAPIClient(api_key, client_id, dispensary)
 
-    # Test endpoints
-    endpoints = [
-        ('tickets', {'limit': 1}),
-        ('customers', {'limit': 1}),
-        ('products', {'limit': 1}),
-    ]
-
-    for endpoint, params in endpoints:
-        print(f"\nTesting /{endpoint}...")
-        result = client.get(endpoint, params)
-        if 'error' in result:
-            print(f"  ❌ Error: {result['error']}")
+    # First test authentication
+    print("\nAuthenticating...")
+    try:
+        if client.authenticate():
+            print(f"  ✅ Authentication successful")
+            print(f"  Token: {client.access_token[:20]}..." if client.access_token else "  No token")
         else:
-            count = len(result.get('data', result.get('tickets', result.get('customers', result.get('products', [])))))
-            print(f"  ✅ Success - {count} record(s) returned")
+            print(f"  ❌ Authentication failed")
+            return False
+    except Exception as e:
+        print(f"  ❌ Authentication error: {str(e)}")
+        return False
+
+    # Test ticket endpoint
+    print("\nTesting /ticket endpoint...")
+    try:
+        from datetime import datetime
+        today = datetime.now().strftime('%Y-%m-%d')
+        result = client.get_tickets_by_close_date(today, page=0, page_size=5)
+        data = result.get('data', [])
+        print(f"  ✅ Success - {len(data)} ticket(s) returned for {today}")
+    except Exception as e:
+        print(f"  ❌ Error: {str(e)}")
+
+    # Test product endpoint
+    print("\nTesting /product endpoint...")
+    try:
+        result = client.get_products(page=0, page_size=5)
+        data = result.get('data', result.get('products', []))
+        print(f"  ✅ Success - {len(data)} product(s) returned")
+    except Exception as e:
+        print(f"  ❌ Error: {str(e)}")
 
     return True
 
@@ -152,13 +171,14 @@ def test_treez_data_extraction(days_back=1):
     print("="*50)
 
     api_key = os.environ.get('TREEZ_API_KEY')
+    client_id = os.environ.get('TREEZ_CLIENT_ID', 'chapters_sync')
     dispensary = os.environ.get('TREEZ_DISPENSARY', 'barbarycoast')
 
     if not api_key:
         print("❌ TREEZ_API_KEY not set")
         return
 
-    client = TreezAPIClient(api_key, dispensary)
+    client = TreezAPIClient(api_key, client_id, dispensary)
 
     # Calculate date range
     end_date = datetime.now()
