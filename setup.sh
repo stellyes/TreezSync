@@ -272,7 +272,7 @@ if [ "$SECRET_EXISTS" == "no" ]; then
 
     echo "Created secret: $SECRET_NAME"
     echo ""
-    echo "⚠️  IMPORTANT: Update the secret with your actual credentials:"
+    echo ">>> IMPORTANT: Update the secret with your actual credentials:"
     echo "   aws secretsmanager update-secret --secret-id $SECRET_NAME --region $REGION --secret-string '{...}'"
 else
     echo "Secret already exists: $SECRET_NAME"
