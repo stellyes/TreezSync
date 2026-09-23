@@ -39,7 +39,7 @@ def test_treez_connection():
     dispensary = os.environ.get('TREEZ_DISPENSARY', 'barbarycoast')
 
     if not api_key:
-        print("❌ TREEZ_API_KEY not set")
+        print("TREEZ_API_KEY not set")
         return False
 
     print(f"Dispensary: {dispensary}")
@@ -52,13 +52,13 @@ def test_treez_connection():
     print("\nAuthenticating...")
     try:
         if client.authenticate():
-            print(f"  ✅ Authentication successful")
+            print(f"  Authentication successful")
             print(f"  Token: {client.access_token[:20]}..." if client.access_token else "  No token")
         else:
-            print(f"  ❌ Authentication failed")
+            print(f"  Authentication failed")
             return False
     except Exception as e:
-        print(f"  ❌ Authentication error: {str(e)}")
+        print(f"  Authentication error: {str(e)}")
         return False
 
     # Test ticket endpoint
@@ -68,18 +68,18 @@ def test_treez_connection():
         today = datetime.now().strftime('%Y-%m-%d')
         result = client.get_tickets_by_close_date(today, page=0, page_size=5)
         data = result.get('data', [])
-        print(f"  ✅ Success - {len(data)} ticket(s) returned for {today}")
+        print(f"  Success - {len(data)} ticket(s) returned for {today}")
     except Exception as e:
-        print(f"  ❌ Error: {str(e)}")
+        print(f"  Error: {str(e)}")
 
     # Test product endpoint
     print("\nTesting /product endpoint...")
     try:
         result = client.get_products(page=0, page_size=5)
         data = result.get('data', result.get('products', []))
-        print(f"  ✅ Success - {len(data)} product(s) returned")
+        print(f"  Success - {len(data)} product(s) returned")
     except Exception as e:
-        print(f"  ❌ Error: {str(e)}")
+        print(f"  Error: {str(e)}")
 
     return True
 
@@ -94,7 +94,7 @@ def test_metrc_connection():
     user_key = os.environ.get('METRC_USER_KEY')
 
     if not api_key or not user_key:
-        print("❌ METRC_API_KEY or METRC_USER_KEY not set")
+        print("METRC_API_KEY or METRC_USER_KEY not set")
         print("   Skipping METRC tests")
         return False
 
@@ -114,10 +114,10 @@ def test_metrc_connection():
         print(f"\nTesting {name}...")
         result = client.get(endpoint)
         if 'error' in result:
-            print(f"  ❌ Error: {result['error']}")
+            print(f"  Error: {result['error']}")
         else:
             count = len(result) if isinstance(result, list) else 1
-            print(f"  ✅ Success - {count} record(s) returned")
+            print(f"  Success - {count} record(s) returned")
 
     return True
 
@@ -131,7 +131,7 @@ def test_database_connection():
     db_url = os.environ.get('DATABASE_URL')
 
     if not db_url:
-        print("❌ DATABASE_URL not set")
+        print("DATABASE_URL not set")
         return False
 
     # Parse URL for display (hide password)
@@ -147,20 +147,20 @@ def test_database_connection():
             with conn.cursor() as cursor:
                 cursor.execute("SELECT COUNT(*) FROM sales_records")
                 sales_count = cursor.fetchone()[0]
-                print(f"  ✅ Connected successfully")
-                print(f"  📊 Sales records: {sales_count:,}")
+                print(f"  Connected successfully")
+                print(f"  Sales records: {sales_count:,}")
 
                 cursor.execute("SELECT COUNT(*) FROM customers")
                 customer_count = cursor.fetchone()[0]
-                print(f"  👥 Customers: {customer_count:,}")
+                print(f"  Customers: {customer_count:,}")
 
                 cursor.execute("SELECT COUNT(*) FROM invoices")
                 invoice_count = cursor.fetchone()[0]
-                print(f"  📄 Invoices: {invoice_count:,}")
+                print(f"  Invoices: {invoice_count:,}")
 
         return True
     except Exception as e:
-        print(f"  ❌ Connection failed: {e}")
+        print(f"  Connection failed: {e}")
         return False
 
 
@@ -175,7 +175,7 @@ def test_treez_data_extraction(days_back=1):
     dispensary = os.environ.get('TREEZ_DISPENSARY', 'barbarycoast')
 
     if not api_key:
-        print("❌ TREEZ_API_KEY not set")
+        print("TREEZ_API_KEY not set")
         return
 
     client = TreezAPIClient(api_key, client_id, dispensary)
@@ -196,10 +196,10 @@ def test_treez_data_extraction(days_back=1):
     result = client.get('tickets', params)
 
     if 'error' in result:
-        print(f"  ❌ Error: {result['error']}")
+        print(f"  Error: {result['error']}")
     else:
         tickets = result.get('data', result.get('tickets', []))
-        print(f"  ✅ Found {len(tickets)} tickets")
+        print(f"  Found {len(tickets)} tickets")
 
         if tickets:
             # Sample ticket analysis
@@ -220,10 +220,10 @@ def test_treez_data_extraction(days_back=1):
     result = client.get('customers', {'limit': 100})
 
     if 'error' in result:
-        print(f"  ❌ Error: {result['error']}")
+        print(f"  Error: {result['error']}")
     else:
         customers = result.get('data', result.get('customers', []))
-        print(f"  ✅ Found {len(customers)} customers")
+        print(f"  Found {len(customers)} customers")
 
 
 def test_full_sync(dry_run=True):
@@ -237,7 +237,7 @@ def test_full_sync(dry_run=True):
     missing = [v for v in required_vars if not os.environ.get(v)]
 
     if missing:
-        print(f"❌ Missing required environment variables: {', '.join(missing)}")
+        print(f"Missing required environment variables: {', '.join(missing)}")
         return
 
     db_url = os.environ.get('DATABASE_URL')
@@ -254,7 +254,7 @@ def test_full_sync(dry_run=True):
     sync = DataSync(db_url, treez_config, metrc_config)
 
     if dry_run:
-        print("\n🔍 Dry run - would sync:")
+        print("\nDry run - would sync:")
         print("  - Treez tickets (sales data)")
         print("  - Treez customers")
         print("  - Treez invoices")
@@ -263,9 +263,9 @@ def test_full_sync(dry_run=True):
             print("  - METRC transfers")
         print("\nRun with --execute to perform actual sync")
     else:
-        print("\n🚀 Executing full sync...")
+        print("\nExecuting full sync...")
         result = sync.run_full_sync()
-        print(f"\n📊 Sync Result:")
+        print(f"\nSync Result:")
         print(json.dumps(result, indent=2, default=str))
 
 
